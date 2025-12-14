@@ -1,0 +1,90 @@
+name: Release Notifications
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Release tag (e.g. v1.2.3)
+        required: true
+      html_url:
+        description: Release URL (optional)
+        required: false
+      body:
+        description: Release body (optional)
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  notify-release:
+    name: Notify New Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare Notification Context
+        env:
+          TAG_NAME: ${{ github.event_name == 'release' && github.event.release.tag_name || github.event.inputs.tag_name }}
+          HTML_URL: ${{ github.event_name == 'release' && github.event.release.html_url || github.event.inputs.html_url }}
+          BODY: ${{ github.event_name == 'release' && github.event.release.body || github.event.inputs.body }}
+        run: |
+          set -euo pipefail
+
+          tag="${TAG_NAME:-${GITHUB_REF_NAME:-manual}}"
+          url="${HTML_URL:-https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}}"
+
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
+          echo "RAW_BODY<<EOF" >> "$GITHUB_ENV"
+          echo "${BODY:-}" >> "$GITHUB_ENV"
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Prepare Release Body
+        run: |
+          set -euo pipefail
+          
+          # 直接使用原始body，截断过长内容
+          BODY="${RAW_BODY:-}"
+          MAX_LENGTH=800
+          
+          if [ ${#BODY} -gt $MAX_LENGTH ]; then
+            TRUNCATED="${BODY:0:$MAX_LENGTH}"
+            FINAL_BODY="${TRUNCATED% *}..."
+            echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
+            echo "$FINAL_BODY" >> $GITHUB_ENV
+            echo "" >> $GITHUB_ENV
+            echo "(内容过长，仅显示前部分)" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
+            echo "$BODY" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          fi
+
+      - name: Send Telegram Notification to Group Topic
+        env:
+          MESSAGE: |
+            🚀 New Release: ${{ env.RELEASE_TAG }}
+            
+            ${{ env.RELEASE_BODY }}
+            
+            Link: ${{ env.RELEASE_URL }}
+        run: |
+          curl -fSs -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_TO_GROUP }}" \
+            -d "message_thread_id=${{ secrets.TELEGRAM_RELEASE_TOPIC_ID }}" \
+            --data-urlencode "text=$MESSAGE"
+
+      - name: Send Telegram Notification to Channel
+        env:
+          MESSAGE: |
+            🚀 New Release: ${{ env.RELEASE_TAG }}
+            
+            ${{ env.RELEASE_BODY }}
+            
+            Link: ${{ env.RELEASE_URL }}
+        run: |
+          curl -fSs -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_TO_CHANNEL }}" \
+            --data-urlencode "text=$MESSAGE"

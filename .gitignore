@@ -659,6 +659,8 @@ out
 # Nuxt.js build / generate output
 .nuxt
 dist
+!web/dist/
+web/src/
 
 # Gatsby files
 .cache/
@@ -757,16 +759,19 @@ result
 # Q2TG specific temp files
 data/temp/
 scripts/
-compose.yaml
 docs/mtcute_refactor_log.md
 docs/ROADMAP_MTCUTE.md
 cloudflare/
-Dockerfile.edge
-compose.dev.yaml
-compose.test.yaml
-compose.edge.yaml
-compose.dev.yaml.bak
-compose.example.yaml
+
+# Compose: ignore all except example variants
+compose*.yml
+compose*.yaml
+!compose.*example*.yml
+!compose.*example*.yaml
+
+# Dockerfiles: keep only the base filename
+Dockerfile*
+!Dockerfile
 
 # Strict Ignores for NapGram
 main/data/
@@ -790,5 +795,11 @@ temp/
 tmp/
 .pnpm-store/
 # Internal analysis documents (not for version control)
-docs/technical_analysis.md
+
 docs/feature_comparison.md
+docs/dependency-analysis.md
+docs/ADMIN_SETUP.md
+docs/PHASE1_README.md
+docs/PHASE2_README.md
+docs/PHASE3_README.md
+docs/PHASE4_README.md

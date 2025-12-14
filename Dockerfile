@@ -1,22 +1,29 @@
 # syntax=docker/dockerfile:1
+ARG NODE_VERSION=25-slim
 
-FROM node:22-slim AS base
+# === Stage: Extract TGS conversion binaries ===
+FROM edasriyan/lottie-to-gif:latest AS lottie
+
+# === Stage: Base ===
+FROM node:${NODE_VERSION} AS base
 ARG USE_MIRROR=true
 ENV DEBIAN_FRONTEND=noninteractive
 
 # 基础运行时依赖
 RUN if [ "$USE_MIRROR" = "true" ]; then \
-      sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
+      sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && apt-get install -y --no-install-recommends \
-    curl wget \
+    curl wget bash \
     fonts-wqy-microhei \
     libpixman-1-0 libcairo2 libpango1.0-0 libgif7 libjpeg62-turbo libpng16-16 librsvg2-2 libvips42 ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-ENV DATABASE_URL=postgres://user:password@postgres/db_name
-# 指定 pnpm 版本防止变动
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# 复制TGS转换工具（lottie_to_png和gifski）
+COPY --from=lottie /usr/bin/lottie_to_png /usr/bin/
+COPY --from=lottie /usr/bin/gifski /usr/bin/
+
+RUN npm install -g corepack@latest --force && corepack enable && corepack prepare pnpm@latest --activate && npm install -g npm@latest
 WORKDIR /app
 
 FROM base AS build
@@ -24,7 +31,7 @@ ARG USE_MIRROR=true
 
 # 编译环境依赖 (python3, build-essential)
 RUN if [ "$USE_MIRROR" = "true" ]; then \
-      sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
+      sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources; \
     fi && \
     apt-get update && apt-get install -y --no-install-recommends \
     python3 build-essential pkg-config \
@@ -35,29 +42,26 @@ COPY pnpm-workspace.yaml pnpm-lock.yaml package.json* /app/
 COPY main/package.json /app/main/
 COPY web/package.json /app/web/
 
-# 分两步安装以精确控制原生模块编译：
-# 1. 先安装所有依赖但跳过所有安装脚本（避免 sharp 尝试源码编译）
-# 2. 然后递归重新编译必需的原生模块（-r 确保在所有 workspace 中执行）
-RUN pnpm install --frozen-lockfile --shamefully-hoist --ignore-scripts && \
-    pnpm -r rebuild better-sqlite3 silk-sdk && \
-    pnpm --filter=@prisma/engines run postinstall
+# 三步安装策略：
+# 1. 先安装 Prisma 相关包并运行 postinstall（下载引擎）
+# 2. 再安装其他依赖并跳过脚本（避免 sharp 尝试源码编译）
+# 3. 编译必需的原生模块
+#    - better-sqlite3: mtcute 用于 Telegram session 存储
+#    - silk-wasm 是纯 WASM，无需编译
+RUN pnpm install --filter=prisma --filter=@prisma/client --filter=@prisma/engines --frozen-lockfile --shamefully-hoist && \
+    pnpm install --frozen-lockfile --shamefully-hoist --ignore-scripts && \
+    pnpm -r rebuild better-sqlite3
 
-# 源码构建
+# 源码构建（后端）
 COPY main/ /app/main/
 RUN DATABASE_URL="postgresql://dummy" pnpm --filter=@napgram/core run prisma generate
 RUN pnpm --filter=@napgram/core run build
 
-# Frontend
-COPY web/ /app/web/
-RUN pnpm --filter=web run build
+# Frontend 使用预构建产物
+COPY web/dist/ /app/web/dist/
 
 FROM base AS release
-# Lottie Converter
-COPY --from=edasriyan/lottie-to-gif:latest /usr/bin/lottie_to_gif.sh /usr/local/bin/tgs_to_gif
-COPY --from=edasriyan/lottie-to-gif:latest /usr/bin/lottie_common.sh /usr/local/bin/lottie_common.sh
-COPY --from=edasriyan/lottie-to-gif:latest /usr/bin/lottie_to_png /usr/local/bin/lottie_to_png
-COPY --from=edasriyan/lottie-to-gif:latest /usr/bin/gifski /usr/local/bin/gifski
-ENV TGS_TO_GIF=/usr/local/bin/tgs_to_gif
+# Note: TGS to GIF conversion now handled by tgs-to npm package
 
 COPY --from=build --chown=node:node /app/node_modules /app/node_modules
 COPY --from=build --chown=node:node /app/main/build /app/build

@@ -1,5 +1,5 @@
 import type { IQQClient, IQQClientFactory, QQClientCreateParams } from './interface';
-import { NapCatAdapter } from './napcat/adapter';
+import { NapCatAdapter } from './NapCatAdapter';
 import { getLogger } from '../../../shared/logger';
 
 const logger = getLogger('QQClientFactory');
@@ -14,7 +14,7 @@ export class QQClientFactory implements IQQClientFactory {
 
         switch (params.type) {
             case 'napcat':
-                return new NapCatAdapter(params);
+                return new NapCatAdapter(params) as unknown as IQQClient;
 
 
             default:

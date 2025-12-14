@@ -131,15 +131,19 @@ export default class Telegram {
 
   private async config() {
     this.me = await this.client.getMe();
-
     this.dispatcher.onNewMessage(this.onMessage);
     this.dispatcher.onEditMessage(this.onEditedMessage);
+    this.dispatcher.onDeleteMessage(this.onDeleteMessage);
   }
 
   private onMessage = async (msg: Message) => {
-    this.logger.info(`[TG] recv ${msg.id} from ${msg.chat.id}`);
+    this.logger.debug(`[TG] recv ${msg.id} from ${msg.chat.id}`);
     for (const handler of this.onMessageHandlers) {
-      await handler(msg);
+      const result = await handler(msg);
+      // 如果 handler 返回 true，表示消息已被处理，停止调用后续 handler
+      if (result === true) {
+        return;
+      }
     }
   };
 
@@ -149,8 +153,17 @@ export default class Telegram {
     }
   };
 
+  private onDeleteMessage = async (update: any) => {
+    const ids = update.messageIds || update.messages || [];
+    this.logger.info(`[TG] message deleted in ${update.channelId || update.chatId}: ${ids.join(', ')}`);
+    for (const handler of this.onDeletedMessageHandlers) {
+      await handler(update);
+    }
+  };
+
   private readonly onMessageHandlers: Array<MessageHandler> = [];
   private readonly onEditedMessageHandlers: Array<MessageHandler> = [];
+  private readonly onDeletedMessageHandlers: Array<(update: any) => Promise<void>> = [];
 
   public addNewMessageEventHandler(handler: MessageHandler) {
     this.onMessageHandlers.push(handler);
@@ -171,6 +184,17 @@ export default class Telegram {
     const index = this.onEditedMessageHandlers.indexOf(handler);
     if (index > -1) {
       this.onEditedMessageHandlers.splice(index, 1);
+    }
+  }
+
+  public addDeletedMessageEventHandler(handler: (update: any) => Promise<void>) {
+    this.onDeletedMessageHandlers.push(handler);
+  }
+
+  public removeDeletedMessageEventHandler(handler: (update: any) => Promise<void>) {
+    const index = this.onDeletedMessageHandlers.indexOf(handler);
+    if (index > -1) {
+      this.onDeletedMessageHandlers.splice(index, 1);
     }
   }
 

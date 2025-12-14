@@ -52,10 +52,10 @@ const configParsed = z.object({
   DISABLE_FILE_UPLOAD_TIP: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('false'),
   IMAGE_SUMMARY: z.string().optional(),
   ENABLE_FEATURE_MANAGER: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('false'),
-  ENABLE_LEGACY_ICQQ: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('false'),
 
   LISTEN_PORT: z.string().regex(/^\d+$/).transform(Number).default('8080'),
 
+  ADMIN_TOKEN: z.string().optional(),
   UI_PATH: z.string().optional(),
   UI_PROXY: z.string().url().optional(),
   WEB_ENDPOINT: z.string().url().optional(),
@@ -64,6 +64,9 @@ const configParsed = z.object({
   POSTHOG_OPTOUT: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('false'),
   SHOW_NICKNAME_MODE: z.string().regex(/^[01]{2}$/).default('11'),
   FORWARD_MODE: z.string().regex(/^[01]{2}$/).default('11'),
+  ENABLE_AUTO_RECALL: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('true'),
+  ENABLE_OFFLINE_NOTIFICATION: z.string().transform((v) => ['true', '1', 'yes'].includes(v.toLowerCase())).default('true'),
+  OFFLINE_NOTIFICATION_COOLDOWN: z.string().regex(/^\d+$/).transform(Number).default('3600000'), // 默认1小时
 
   REPO: z.string().default('Local Build'),
   REF: z.string().default('Local Build'),

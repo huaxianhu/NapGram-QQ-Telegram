@@ -1,28 +1,35 @@
 import { getLogger } from '../../shared/logger';
+import { performanceMonitor } from '../../infrastructure';
 import type { IQQClient } from '../../infrastructure/clients/qq';
 import type { UnifiedMessage, MessageContent, ImageContent, VideoContent, AudioContent, FileContent } from '../../domain/message';
 import { messageConverter } from '../../domain/message';
 import type Telegram from '../../infrastructure/clients/telegram/client';
 import type Instance from '../../domain/models/Instance';
-import ForwardMap from '../../domain/models/ForwardMap';
-import { MediaFeature } from '../media/MediaFeature';
+import ForwardMap, { type ForwardPairRecord } from '../../domain/models/ForwardMap';
+import { MediaFeature } from '../MediaFeature';
 import { CommandsFeature } from '../commands/CommandsFeature';
 import env from '../../domain/models/env';
+
 import db from '../../domain/models/db';
 import flags from '../../domain/constants/flags';
 import { Message } from '@mtcute/core';
 import path from 'path';
 import fs from 'fs';
 import { md5Hex } from '../../shared/utils/hashing';
-import silk from '../../shared/encoding/silk';
+import silk from '../../shared/utils/encoding/silk';
 import { promisify } from 'util';
 import { execFile } from 'child_process';
 import { fileTypeFromBuffer } from 'file-type';
+import convert from '../../shared/utils/convert';
 
 import { TelegramSender } from './senders/TelegramSender';
+import { ForwardMediaPreparer } from './senders/MediaPreparer';
 import { ThreadIdExtractor } from '../commands/services/ThreadIdExtractor';
 import { ForwardMapper } from './services/MessageMapper';
 import { ReplyResolver } from './services/ReplyResolver';
+import { MediaGroupHandler } from './handlers/MediaGroupHandler';
+import { MessageUtils } from './utils/MessageUtils';
+import { TelegramMessageHandler } from './handlers/TelegramMessageHandler';
 
 const logger = getLogger('ForwardFeature');
 const execFileAsync = promisify(execFile);
@@ -35,6 +42,9 @@ export class ForwardFeature {
     private telegramSender: TelegramSender;
     private mapper: ForwardMapper;
     private replyResolver: ReplyResolver;
+    private mediaGroupHandler: MediaGroupHandler;
+    private tgMessageHandler: TelegramMessageHandler;
+    private mediaPreparer: ForwardMediaPreparer;
 
     constructor(
         private readonly instance: Instance,
@@ -52,8 +62,22 @@ export class ForwardFeature {
         this.telegramSender = new TelegramSender(instance, media);
         this.mapper = new ForwardMapper();
         this.replyResolver = new ReplyResolver(this.mapper);
+        this.mediaPreparer = new ForwardMediaPreparer(instance, media);
+        this.mediaGroupHandler = new MediaGroupHandler(
+            this.qqClient,
+            (msg) => this.mediaPreparer.prepareMediaForQQ(msg),
+            (pair) => this.getNicknameMode(pair),
+        );
+        this.tgMessageHandler = new TelegramMessageHandler(
+            this.qqClient,
+            this.mediaGroupHandler,
+            this.replyResolver,
+            (msg) => this.mediaPreparer.prepareMediaForQQ(msg),
+            this.renderContent.bind(this),
+            (pair) => this.getNicknameMode(pair),
+        );
         this.setupListeners();
-        logger.info('ForwardFeature initialized');
+        logger.info('ForwardFeature ✓ 初始化完成');
 
         // Register commands
         if (this.commands) {
@@ -70,18 +94,49 @@ export class ForwardFeature {
 
     private setupListeners() {
         this.qqClient.on('message', this.handleQQMessage);
-        this.tgBot.addNewMessageEventHandler(this.handleTGMessage);
-        logger.debug('ForwardFeature listeners attached');
+        this.tgBot.addNewMessageEventHandler(async (tgMsg: Message) => {
+            const threadId = new ThreadIdExtractor().extractFromRaw((tgMsg as any).raw || tgMsg);
+
+            const pair = this.forwardMap.findByTG(
+                tgMsg.chat.id,
+                threadId,
+                !threadId, // 如果有 threadId，禁用 fallback，避免落到 general
+            );
+            if (!pair) {
+                logger.debug(`No QQ mapping for TG chat ${tgMsg.chat.id} thread ${threadId || 'none'}`);
+                return;
+            }
+
+            // Check forward mode (TG -> QQ is index 1)
+            const forwardMode = this.getForwardMode(pair);
+            if (forwardMode[1] === '0') {
+                logger.debug(`Forward TG->QQ disabled for chat ${tgMsg.chat.id} (mode: ${forwardMode})`);
+                return;
+            }
+
+            await this.tgMessageHandler.handleTGMessage(tgMsg, pair);
+        });
+        logger.debug('[ForwardFeature] listeners attached');
     }
 
-    public nicknameMode: string = env.SHOW_NICKNAME_MODE;
-    public forwardMode: string = env.FORWARD_MODE;
+    /**
+     * 获取指定 pair 的转发模式配置
+     * 优先使用 pair 的配置，若为 null 则使用环境变量默认值
+     */
+    private getForwardMode(pair: ForwardPairRecord): string {
+        return pair.forwardMode || env.FORWARD_MODE;
+    }
+
+    /**
+     * 获取指定 pair 的昵称模式配置
+     * 优先使用 pair 的配置，若为 null 则使用环境变量默认值
+     */
+    private getNicknameMode(pair: ForwardPairRecord): string {
+        return pair.nicknameMode || env.SHOW_NICKNAME_MODE;
+    }
 
     private handleQQMessage = async (msg: UnifiedMessage) => {
-        // Check forward mode (QQ -> TG is index 0)
-        if (this.forwardMode[0] === '0') {
-            return;
-        }
+        const startTime = Date.now(); // 📊 开始计时
 
         try {
             const pair = this.forwardMap.findByQQ(msg.chat.id);
@@ -89,6 +144,19 @@ export class ForwardFeature {
                 logger.debug(`No TG mapping for QQ chat ${msg.chat.id}`);
                 return;
             }
+
+            // Check forward mode (QQ -> TG is index 0)
+            const forwardMode = this.getForwardMode(pair);
+            if (forwardMode[0] === '0') {
+                logger.debug(`Forward QQ->TG disabled for chat ${msg.chat.id} (mode: ${forwardMode})`);
+                return;
+            }
+
+            logger.info('[Forward][QQ->TG] incoming', {
+                qqMsgId: msg.id,
+                qqRoomId: msg.chat.id,
+                tgChatId: pair.tgChatId,
+            });
 
             // Sender Blocklist Filter
             if (pair.ignoreSenders) {
@@ -121,426 +189,98 @@ export class ForwardFeature {
                 }
             }
 
+            // 填充 @ 提及的展示名称：优先群名片，其次昵称，最后 QQ 号
+            await MessageUtils.populateAtDisplayNames(msg, this.qqClient);
+
             const tgChatId = Number(pair.tgChatId);
             const chat = await this.instance.tgBot.getChat(tgChatId);
 
             // 处理回复 - 使用 ReplyResolver
             const replyToMsgId = await this.replyResolver.resolveQQReply(msg, pair.instanceId, pair.qqRoomId);
 
-            const sentMsg = await this.telegramSender.sendToTelegram(chat, msg, pair, replyToMsgId, this.nicknameMode);
+            const sentMsg = await this.telegramSender.sendToTelegram(chat, msg, pair, replyToMsgId, this.getNicknameMode(pair));
 
             if (sentMsg) {
                 await this.mapper.saveMessage(msg, sentMsg, pair.instanceId, pair.qqRoomId, BigInt(tgChatId));
-                logger.info(`[Forward] QQ message ${msg.id} -> TG ${tgChatId} (id: ${sentMsg.id})`);
+
+                // 📊 记录成功 - 计算处理延迟
+                const latency = Date.now() - startTime;
+                performanceMonitor.recordMessage(latency);
+
+                logger.info(`[Forward][QQ->TG] message ${msg.id} -> TG ${tgChatId} (id: ${sentMsg.id}) in ${latency}ms`);
             }
         } catch (error) {
+            // 📊 记录错误
+            performanceMonitor.recordError();
             logger.error('Failed to forward QQ message:', error);
         }
     };
 
+
+
+
+
     private handleModeCommand = async (msg: UnifiedMessage, args: string[]) => {
         const chatId = msg.chat.id;
         // Extract threadId from raw message
+        // Extract threadId from raw message
         const raw = (msg.metadata as any)?.raw;
-        const threadId = raw?.replyTo?.replyToTopId
-            || raw?.replyTo?.replyToMsgId
-            || raw?.replyToMsgId;
+        // Do not use .extract(msg, args) here because args may contain numbers (e.g. "10" for mode) that are NOT threadId
+        const threadId = new ThreadIdExtractor().extractFromRaw(raw);
+
+        if (!MessageUtils.isAdmin(msg.sender.id, this.instance)) {
+            await MessageUtils.replyTG(this.tgBot, chatId, '您没有权限执行此命令', threadId);
+            return;
+        }
 
         const type = args[0];
         const value = args[1];
 
         if (!type || !value || !/^[01]{2}$/.test(value)) {
-            await this.replyTG(chatId, '用法：/mode <nickname|forward> <00|01|10|11>\n示例：/mode nickname 10 (QQ->TG显示昵称，TG->QQ不显示)', threadId);
+            await MessageUtils.replyTG(this.tgBot, chatId, '用法：/mode <nickname|forward> <00|01|10|11>\n示例：/mode nickname 10 (QQ→TG显示昵称，TG→QQ不显示)', threadId);
             return;
         }
 
-        if (type === 'nickname') {
-            this.nicknameMode = value;
-            await this.replyTG(chatId, `昵称显示模式已更新为: ${value}`, threadId);
-        } else if (type === 'forward') {
-            this.forwardMode = value;
-            await this.replyTG(chatId, `转发模式已更新为: ${value}`, threadId);
-        } else {
-            await this.replyTG(chatId, '未知模式类型，请使用 nickname 或 forward', threadId);
+        // 查找当前聊天对应的 pair
+        const pair = this.forwardMap.findByTG(chatId, threadId, !threadId);
+        if (!pair) {
+            await MessageUtils.replyTG(this.tgBot, chatId, '错误：未找到对应的转发配置', threadId);
+            return;
         }
-    };
 
-    private handleTGMessage = async (tgMsg: Message) => {
         try {
-            const rawText = tgMsg.text || '';
-            logger.info('[Forward] TG incoming', {
-                id: tgMsg.id,
-                chatId: tgMsg.chat.id,
-                text: rawText.slice(0, 100),
+            // 更新数据库
+            const updateData: any = {};
+            if (type === 'nickname') {
+                updateData.nicknameMode = value;
+            } else if (type === 'forward') {
+                updateData.forwardMode = value;
+            } else {
+                await MessageUtils.replyTG(this.tgBot, chatId, '未知模式类型，请使用 nickname 或 forward', threadId);
+                return;
+            }
+
+            const updated = await db.forwardPair.update({
+                where: { id: pair.id },
+                data: updateData,
+                select: { id: true, forwardMode: true, nicknameMode: true },
             });
 
-            // Use ThreadIdExtractor to get threadId from raw message or wrapper
-            const threadId = new ThreadIdExtractor().extractFromRaw((tgMsg as any).raw || tgMsg);
-
-            // 兜底处理 /bind，防止命令层未捕获
-            if (rawText.startsWith('/bind') || rawText.startsWith('/unbind')) {
-                const tokens = rawText.split(/\s+/);
-                // 支持 /bind@bot 格式
-                if (tokens[0].includes('@')) tokens[0] = tokens[0].split('@')[0];
-                const cmd = tokens[0].replace('/', '');
-                const qqId = tokens[1];
-                const chatId = tgMsg.chat.id;
-                const senderId = tgMsg.sender.id;
-
-                if (!this.isAdmin(String(senderId))) {
-                    await this.replyTG(chatId, '无权限执行该命令', threadId);
-                    return;
-                }
-
-                if (cmd === 'bind') {
-                    if (!qqId || !/^-?\d+$/.test(qqId) || !chatId) {
-                        await this.replyTG(chatId, '用法：/bind <qq_group_id> [thread_id]', threadId);
-                        return;
-                    }
-
-                    const bindThreadId = tokens[2] ? parseInt(tokens[2]) : undefined;
-                    const existed = this.forwardMap.findByQQ(qqId) || this.forwardMap.findByTG(chatId, bindThreadId);
-                    if (existed) {
-                        await this.replyTG(chatId, '该 QQ 或 TG 已存在绑定', threadId);
-                        return;
-                    }
-
-                    await this.forwardMap.add(qqId, chatId, bindThreadId);
-                    const threadInfo = bindThreadId ? ` (话题 ${bindThreadId})` : '';
-                    await this.replyTG(chatId, `绑定成功：QQ ${qqId} <-> TG ${chatId}${threadInfo}`, threadId);
-                } else if (cmd === 'unbind') {
-                    const target = qqId && /^-?\d+$/.test(qqId)
-                        ? this.forwardMap.findByQQ(qqId)
-                        : this.forwardMap.findByTG(chatId);
-                    if (!target) {
-                        await this.replyTG(chatId, '未找到绑定关系', threadId);
-                        return;
-                    }
-                    await this.forwardMap.remove(target.qqRoomId);
-                    await this.replyTG(chatId, `已解绑：QQ ${target.qqRoomId} <-> TG ${target.tgChatId}`, threadId);
-                }
-                return;
-            }
-
-            // Check forward mode (TG -> QQ is index 1)
-            if (this.forwardMode[1] === '0') {
-                return;
-            }
-
-            const pair = this.forwardMap.findByTG(
-                tgMsg.chat.id,
-                threadId,
-                !threadId, // 如果有 threadId，禁用 fallback，避免落到 general
-            );
-            if (!pair) {
-                logger.debug(`No QQ mapping for TG chat ${tgMsg.chat.id} thread ${threadId || 'none'}`);
-                return;
-            }
-
-            const unified = messageConverter.fromTelegram(tgMsg as any);
-            await this.prepareMediaForQQ(unified);
-
-            // 如果是回复，尝试找到对应的 QQ 消息 ID，构造 QQ 的 reply 段
-
-
-            const qqReply = await this.replyResolver.resolveTGReply(
-                tgMsg as any,
-                pair.instanceId,
-                Number(pair.tgChatId)
-            );
-
-
-
-            const replySegment = qqReply ? [{
-                type: 'reply' as const,
-                data: {
-                    id: String(qqReply.seq),
-                    seq: qqReply.seq,
-                    time: qqReply.time,
-                    senderUin: qqReply.senderUin,
-                    peer: {
-                        chatType: 2,  // Group chat
-                        peerUid: String(qqReply.qqRoomId),
-                    }
-                }
-            }] : [];
-
-
-
-            // CRITICAL: Remove TG reply segments (contain TG message IDs like 637)
-            // We'll add our own QQ reply segment with QQ message ID instead
-            unified.content = unified.content.filter(c => c.type !== 'at' && c.type !== 'reply');
-
-            // Strip explicit @mention from the beginning of the text if present
-            const firstTextIndex = unified.content.findIndex(c => c.type === 'text');
-            if (firstTextIndex !== -1) {
-                const textData = unified.content[firstTextIndex].data as any;
-                if (textData.text) {
-                    const originalText = textData.text;
-                    // Remove @username or @userid at the start, allowing for whitespace
-                    textData.text = textData.text.replace(/^\s*@\S+\s*/, '');
-                    if (originalText !== textData.text) {
-                        logger.debug(`Stripped mention from text: "${originalText}" -> "${textData.text}"`);
-                    }
-                }
-            }
-
-            const hasMedia = unified.content.some(c => ['video', 'file'].includes(c.type));
-            const hasSplitMedia = unified.content.some(c => ['audio', 'image'].includes(c.type));
-            const showTGToQQNickname = this.nicknameMode[1] === '1';
-
-            let receipt;
-
-            if (hasMedia) {
-                // 使用合并转发 (Video, File)
-                const segments = await messageConverter.toNapCat(unified);
-
-                // Reply will be added to NapCat segments directly, not to unified.content
-
-                const mediaSegments = [
-                    ...replySegment.map(r => ({ type: r.type, data: r.data })),
-                    ...(await messageConverter.toNapCat(unified))
-                ];
-
-                const node = {
-                    type: 'node',
-                    data: {
-                        name: showTGToQQNickname ? unified.sender.name : 'Anonymous', // 控制节点名称
-                        uin: this.qqClient.uin, // 使用 Bot 的 UIN，但显示 TG 用户名
-                        content: mediaSegments
-                    }
-                };
-
-                receipt = await this.qqClient.sendGroupForwardMsg(String(pair.qqRoomId), [node]);
-
-            } else if (hasSplitMedia) {
-                // 语音和图片消息特殊处理：分两次调用 API 发送
-                const headerText = showTGToQQNickname ? `${unified.sender.name}:\n` : '';
-                const textSegments = unified.content.filter(c =>
-                    !['audio', 'image'].includes(c.type) &&
-                    !(c.type === 'text' && !c.data.text)
-                );
-
-                const hasContentToSend = headerText || textSegments.length > 0 || replySegment.length > 0;
-
-                if (hasContentToSend) {
-                    // Convert text segments to NapCat format first
-                    const textNapCatSegments = await messageConverter.toNapCat({
-                        ...unified,
-                        content: textSegments
-                    });
-
-                    // Build final segments with reply
-                    const headerSegments = [
-                        ...replySegment.map(r => ({ type: r.type, data: r.data })),
-                        { type: 'text', data: { text: headerText } },
-                        ...textNapCatSegments
-                    ];
-
-                    const headerMsg: UnifiedMessage = {
-                        ...unified,
-                        content: headerSegments as any
-                    };
-                    // Mark as pre-converted to skip toNapCat in sendMessage
-                    (headerMsg as any).__napCatSegments = true;
-
-                    // 发送 Header
-                    await this.qqClient.sendMessage(String(pair.qqRoomId), headerMsg);
-                }
-
-                // 2. 发送媒体 (Audio, Image)
-                const mediaSegments = unified.content.filter(c => ['audio', 'image'].includes(c.type));
-                const mediaMsg: UnifiedMessage = {
-                    ...unified,
-                    content: mediaSegments
-                };
-
-                receipt = await this.qqClient.sendMessage(String(pair.qqRoomId), mediaMsg);
-
+            // 同步更新内存中的 pair 对象（立即生效）
+            if (type === 'nickname') {
+                pair.nicknameMode = value;
             } else {
-                // 普通文本消息，保持原样
-                const headerText = showTGToQQNickname ? `${unified.sender.name}:\n` : '';
-                // Convert to NapCat segments first, then add reply
-                const baseSegments = await messageConverter.toNapCat(unified);
-
-                logger.debug('[Debug] replySegment before map:', JSON.stringify(replySegment, null, 2));
-
-                const segments = [
-                    ...replySegment.map(r => ({ type: r.type, data: r.data })),
-                    { type: 'text', data: { text: headerText } },
-                    ...baseSegments
-                ];
-
-                // Create message with NapCat segments 
-                unified.content = segments as any;
-                // Mark as pre-converted to skip toNapCat conversion in sendMessage
-                (unified as any).__napCatSegments = true;
-
-                unified.chat.id = String(pair.qqRoomId);
-                unified.chat.type = 'group';
-
-                receipt = await this.qqClient.sendMessage(String(pair.qqRoomId), unified);
+                pair.forwardMode = value;
             }
 
-            if (receipt.success) {
-                const msgId = receipt.messageId || (receipt as any).data?.message_id || (receipt as any).id;
-                logger.info(`[Forward] TG message ${tgMsg.id} -> QQ ${pair.qqRoomId} (seq: ${msgId})`);
-                if (msgId) {
-                    // Save mapping for reply lookup (QQ -> TG reply)
-                    try {
-                        await db.message.create({
-                            data: {
-                                qqRoomId: pair.qqRoomId,
-                                qqSenderId: BigInt(0), // Self sent
-                                time: Math.floor(Date.now() / 1000),
-                                seq: Number(msgId), // Store message_id as seq
-                                rand: BigInt(0),
-                                pktnum: 0,
-                                tgChatId: BigInt(pair.tgChatId),
-                                tgMsgId: tgMsg.id,
-                                tgSenderId: BigInt(tgMsg.sender.id || 0),
-                                instanceId: pair.instanceId,
-                                brief: unified.content.map(c => this.renderContent(c)).join(' ').slice(0, 50),
-                            }
-                        });
-                        logger.debug(`Saved TG->QQ mapping: seq=${msgId} <-> tgMsgId=${tgMsg.id}`);
-                    } catch (e) {
-                        logger.warn('Failed to save TG->QQ message mapping:', e);
-                    }
-                } else {
-                    logger.warn('TG->QQ forwarded but no messageId in receipt, cannot save mapping.');
-                }
-            } else if (receipt.error) {
-                logger.warn(`TG message ${tgMsg.id} forwarded to QQ ${pair.qqRoomId} failed: ${receipt.error}`);
-            }
+            const modeName = type === 'nickname' ? '昵称显示模式' : '转发模式';
+            await MessageUtils.replyTG(this.tgBot, chatId, `${modeName}已更新为: ${value}`, threadId);
+            logger.info(`Updated ${type} mode to ${value} for pair ${pair.id} (QQ: ${pair.qqRoomId}, TG: ${pair.tgChatId})`);
         } catch (error) {
-            logger.error('Failed to forward TG message:', error);
+            logger.error('Failed to update mode:', error);
+            await MessageUtils.replyTG(this.tgBot, chatId, '更新失败，请查看日志', threadId);
         }
     };
-
-    /**
-     * 为 QQ 侧填充媒体 Buffer/URL，提升兼容性。
-     */
-    private async prepareMediaForQQ(msg: UnifiedMessage) {
-        if (!this.media) return;
-
-        await Promise.all(msg.content.map(async (content) => {
-            try {
-                if (content.type === 'image') {
-                    content.data.file = await this.ensureFilePath(await this.ensureBufferOrPath(content as ImageContent), '.jpg');
-                } else if (content.type === 'video') {
-                    // 使用可外网访问的 URL，NapCat 发送视频需要 URL 而非本地路径
-                    content.data.file = await this.ensureFilePath(await this.ensureBufferOrPath(content as VideoContent), '.mp4', false);
-                } else if (content.type === 'audio') {
-                    const oggPath = await this.ensureFilePath(await this.ensureBufferOrPath(content as AudioContent, true), '.ogg', true);
-                    if (oggPath) {
-                        try {
-                            // QQ 语音需要 silk，避免 NapCat 报“语音转换失败”
-                            const silkBuffer = await silk.encode(oggPath);
-                            logger.debug(`Encoded silk buffer size: ${silkBuffer?.length}`);
-                            // 保存 silk 文件并获取 URL (forceLocal=false)，以便 NapCat 可以下载
-                            content.data.file = await this.ensureFilePath(silkBuffer, '.silk', false);
-                        } catch (err) {
-                            // 转码失败则改为普通文件发送，至少保证可收到
-                            logger.warn('Audio silk encode failed, fallback to file', err);
-                            content.type = 'file';
-                            content.data = {
-                                file: oggPath,
-                                filename: path.basename(oggPath),
-                            } as any;
-                        }
-                    } else {
-                        content.data.file = undefined;
-                    }
-                } else if (content.type === 'file') {
-                    const file = content as FileContent;
-                    content.data.file = await this.ensureFilePath(await this.ensureBufferOrPath(file), undefined);
-                }
-            } catch (err) {
-                logger.warn('Prepare media for QQ failed, skip media content:', err);
-                content.type = 'text';
-                (content as any).data = { text: this.renderContent(content) };
-            }
-        }));
-    }
-
-    private async ensureBufferOrPath(content: ImageContent | VideoContent | AudioContent | FileContent, forceDownload?: boolean): Promise<Buffer | string | undefined> {
-        if (content.data.file) {
-            if (Buffer.isBuffer(content.data.file)) return content.data.file;
-            if (typeof content.data.file === 'string') {
-                // NapCat 下可能给的是本地绝对路径（record/image 等），如果可访问直接用；否则尝试下载
-                if (!forceDownload && !/^https?:\/\//.test(content.data.file)) {
-                    try {
-                        logger.debug(`Processing media:\n${JSON.stringify(content, null, 2)}`);
-                        await fs.promises.access(content.data.file);
-                        logger.debug(`Media file exists locally: ${content.data.file}`);
-                        return content.data.file;
-                    } catch {
-                        logger.debug(`Local media file not found or accessible, falling back to download: ${content.data.file}`);
-                        // fallback to download below
-                    }
-                }
-                try {
-                    return await this.media?.downloadMedia(content.data.file);
-                } catch (e) {
-                    logger.warn('Failed to download media by url', e);
-                }
-            }
-            // Assume it is a Telegram Media Object
-            try {
-                const mediaObj = content.data.file as any;
-                // logger.debug(`Downloading TG media: type=${mediaObj?.className}, id=${mediaObj?.id}, accessHash=${mediaObj?.accessHash}, dcId=${mediaObj?.dcId}, size=${mediaObj?.size}`);
-                const buffer = await this.instance.tgBot.downloadMedia(mediaObj);
-                logger.debug(`Downloaded media buffer size: ${buffer?.length}`);
-
-                if (!buffer || buffer.length === 0) {
-                    logger.warn('Downloaded buffer is empty, treating as failure');
-                    return undefined;
-                }
-                return buffer as Buffer;
-            } catch (e) {
-                logger.warn('Failed to download media from TG object:', e);
-            }
-        }
-        if (content.data.url && this.media) {
-            return await this.media.downloadMedia(content.data.url);
-        }
-        return undefined;
-    }
-
-    private async ensureFilePath(file: Buffer | string | undefined, ext?: string, forceLocal?: boolean) {
-        if (!file) return undefined;
-        if (Buffer.isBuffer(file)) {
-            const filename = `${Date.now()}-${Math.random().toString(36).substring(7)}${ext || ''}`;
-            const tempDir = path.join(env.DATA_DIR, 'temp');
-            if (!fs.existsSync(tempDir)) {
-                fs.mkdirSync(tempDir, { recursive: true });
-            }
-            const tempPath = path.join(tempDir, filename);
-            await fs.promises.writeFile(tempPath, file);
-
-            if (!forceLocal) {
-                // 1. Try INTERNAL_WEB_ENDPOINT (For Docker Network)
-                if (env.INTERNAL_WEB_ENDPOINT) {
-                    return `${env.INTERNAL_WEB_ENDPOINT}/temp/${filename}`;
-                }
-                // 2. Try WEB_ENDPOINT (Public URL)
-                if (env.WEB_ENDPOINT) {
-                    return `${env.WEB_ENDPOINT}/temp/${filename}`;
-                }
-
-                // 2. Fallback to Docker Host IP (Bridge Gateway)
-                // If running in Docker, we usually map 8082 -> 8080.
-                // NapCat (external container) -> Host (172.17.0.1) -> Port 8082
-                // If running locally, you might need to adjust this or set WEB_ENDPOINT.
-                return `http://172.17.0.1:8082/temp/${filename}`;
-            }
-            return tempPath;
-        }
-        return file;
-    }
-
-
 
     private renderContent(content: MessageContent): string {
         switch (content.type) {
@@ -572,34 +312,12 @@ export class ForwardFeature {
     }
 
 
-
     destroy() {
+        this.mediaGroupHandler.destroy();
         this.qqClient.removeListener('message', this.handleQQMessage);
-        this.tgBot.removeNewMessageEventHandler(this.handleTGMessage);
+        // Note: TG bot event handler cleanup is handled by bot client
         logger.info('ForwardFeature destroyed');
     }
-
-    private isAdmin(userId: string): boolean {
-        const envAdminQQ = env.ADMIN_QQ ? String(env.ADMIN_QQ) : null;
-        const envAdminTG = env.ADMIN_TG ? String(env.ADMIN_TG) : null;
-        return userId === String(this.instance.owner)
-            || (envAdminQQ && userId === envAdminQQ)
-            || (envAdminTG && userId === envAdminTG);
-    }
-
-    private async replyTG(chatId: string | number, text: string, replyTo?: any) {
-        try {
-            const chat = await this.tgBot.getChat(chatId as any);
-            const params: any = { linkPreview: { disable: true } };
-            if (replyTo) params.replyTo = replyTo;
-            await chat.sendMessage(text, params);
-        } catch (error) {
-            logger.warn('Failed to send TG reply:', error);
-        }
-    }
-
-
-
 }
 
 export default ForwardFeature;

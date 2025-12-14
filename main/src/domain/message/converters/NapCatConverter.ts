@@ -1,12 +1,21 @@
 import { BaseConverter } from './BaseConverter';
 import type { UnifiedMessage, MessageContent } from '../types';
+import { TextSegmentConverter } from './segments/TextSegmentConverter';
+import { MediaSegmentConverter } from './segments/MediaSegmentConverter';
+import { InteractionSegmentConverter } from './segments/InteractionSegmentConverter';
+import { JsonCardConverter } from './segments/JsonCardConverter';
 
 export class NapCatConverter extends BaseConverter {
+    private textConverter = new TextSegmentConverter();
+    private mediaConverter = new MediaSegmentConverter();
+    private interactionConverter = new InteractionSegmentConverter();
+    private jsonCardConverter = new JsonCardConverter();
+
     /**
      * 从 NapCat 消息转换为统一格式
      */
     fromNapCat(napCatMsg: any): UnifiedMessage {
-        this.logger.info(`Converting from NapCat: ${napCatMsg.message_id}`);
+        this.logger.debug(`[Forward][QQ->TG] Converting from NapCat: ${napCatMsg.message_id}`);
         this.logger.debug(`Converting NapCat message segments:\n${JSON.stringify(napCatMsg.message, null, 2)}`);
 
         const content: MessageContent[] = [];
@@ -15,7 +24,10 @@ export class NapCatConverter extends BaseConverter {
         if (napCatMsg.message) {
             for (const segment of napCatMsg.message) {
                 const converted = this.convertNapCatSegment(segment, napCatMsg);
-                if (converted) {
+                if (!converted) continue;
+                if (Array.isArray(converted)) {
+                    content.push(...converted);
+                } else {
                     content.push(converted);
                 }
             }
@@ -49,129 +61,78 @@ export class NapCatConverter extends BaseConverter {
         };
     }
 
-    private convertNapCatSegment(segment: any, rawMsg?: any): MessageContent | null {
+    private convertNapCatSegment(segment: any, rawMsg?: any): MessageContent | MessageContent[] | null {
         this.logger.debug(`Converting segment:\n${JSON.stringify(segment, null, 2)}`);
         const data: any = segment?.data || {};
         const type = (segment?.type || '') as string;
         const rawMessage: string | undefined = rawMsg?.raw_message;
 
         switch (type) {
+            // Text types
             case 'text':
-                return {
-                    type: 'text',
-                    data: { text: data.text },
-                };
-
-            case 'image':
-                {
-                    const httpUrl = (data.url && /^https?:/.test(data.url)) ? data.url : undefined;
-                    const httpFile = (data.file && /^https?:/.test(data.file)) ? data.file : undefined;
-                    const url = httpUrl || httpFile || data.url || data.file;
-                    return {
-                        type: 'image',
-                        data: {
-                            url,
-                            file: httpUrl || data.file,
-                            isSpoiler: data.sub_type && parseInt(data.sub_type) > 0,
-                        },
-                    };
-                }
-
-            case 'video':
-                {
-                    let url = data.url || data.file;
-                    // 优先从 raw_message 提取真实视频 URL（data.url/file 可能是缩略图）
-                    if (rawMessage) {
-                        const m = rawMessage.match(/url=([^,\]]+)/);
-                        if (m && m[1]) {
-                            url = m[1].replace(/&amp;/g, '&'); // 解码 HTML 实体
-                        }
-                    }
-                    // 如果仍然不是 HTTP URL，使用原始值
-                    if (!/^https?:/.test(url || '')) {
-                        url = data.url || data.file;
-                    }
-                    return {
-                        type: 'video',
-                        data: {
-                            url,
-                            file: url,
-                        },
-                    };
-                }
-
-            case 'record':
-                return {
-                    type: 'audio',
-                    data: {
-                        url: data.url || data.file,
-                        file: data.file,
-                    },
-                };
-
-            case 'location':
-                return {
-                    type: 'location',
-                    data: {
-                        latitude: Number(data.lat ?? data.latitude ?? 0),
-                        longitude: Number(data.lng ?? data.longitude ?? 0),
-                        title: data.title,
-                        address: data.address,
-                    },
-                };
+                return this.textConverter.convertText(data);
 
             case 'share':
-                return {
-                    type: 'text',
-                    data: {
-                        text: data.url || data.file || rawMessage || '[分享]',
-                    },
-                };
+                return this.textConverter.convertShare(data, rawMessage);
 
             case 'poke':
+                return this.textConverter.convertPoke(data);
+
+            case 'markdown':
+                return this.textConverter.convertMarkdown(data, segment);
+
+            // Media types
+            case 'image':
+                return this.mediaConverter.convertImage(data);
+
+            case 'video':
+                return this.mediaConverter.convertVideo(data, rawMessage);
+
+            case 'record':
+                return this.mediaConverter.convertAudio(data);
+
+            case 'flash':
+                return this.mediaConverter.convertFlash(data);
+
+            case 'file':
+                return this.mediaConverter.convertFile(data, rawMessage);
+
+            case 'mface':
+                return this.mediaConverter.convertSticker(data);
+
+            // Interaction types
+            case 'at':
+                return this.interactionConverter.convertAt(data);
+
+            case 'face':
+                return this.interactionConverter.convertFace(data);
+
+            case 'location':
+                return this.interactionConverter.convertLocation(data);
+
+            case 'dice':
+                return this.interactionConverter.convertDice(data);
+
+            case 'rps':
+                return this.interactionConverter.convertRps(data);
+
+            case 'reply':
+                return this.interactionConverter.convertReply(data);
+
+            // Complex types
+            case 'json': {
+                const converted = this.jsonCardConverter.convertJsonCard(data);
+                if (converted) {
+                    return converted;
+                }
+                const fallback = typeof data.data === 'string' ? data.data : JSON.stringify(segment.data);
                 return {
                     type: 'text',
                     data: {
-                        text: `[戳一戳] ${data.name || ''}`.trim(),
+                        text: this.truncateText(fallback),
                     },
                 };
-
-            case 'flash':
-                return {
-                    type: 'image',
-                    data: {
-                        url: data.url || data.file,
-                        file: data.file,
-                        isSpoiler: true,
-                    },
-                };
-
-            case 'file':
-                return {
-                    type: 'file',
-                    data: {
-                        url: data.url,
-                        filename: data.file || data.name,
-                        size: data.file_size ? Number(data.file_size) : undefined,
-                    },
-                };
-
-            case 'at':
-                return {
-                    type: 'at',
-                    data: {
-                        userId: String(data.qq),
-                        userName: data.name || '',
-                    },
-                };
-
-            case 'face':
-                return {
-                    type: 'face',
-                    data: {
-                        id: Number(data.id),
-                    },
-                };
+            }
 
             case 'forward':
                 // 转发消息需要特殊处理
@@ -185,50 +146,16 @@ export class NapCatConverter extends BaseConverter {
                     },
                 };
 
-            case 'reply':
-                return {
-                    type: 'reply',
-                    data: {
-                        messageId: String(data.id),
-                        senderId: '',
-                        senderName: '',
-                    },
-                };
-
-            case 'markdown':
-            case 'json':
-                // 特殊消息类型，保留原始数据
-                return {
-                    type: 'text',
-                    data: {
-                        text: JSON.stringify(segment.data),
-                    },
-                };
-
-            case 'mface':
-                // 商城表情，转换为图片
-                return {
-                    type: 'sticker',
-                    data: {
-                        url: data.url,
-                        isAnimated: true,
-                    },
-                };
-
-            case 'dice':
-            case 'rps':
-                // 骰子和猜拳，转换为 face
-                return {
-                    type: 'face',
-                    data: {
-                        id: Number(segment.data.result),
-                        text: type === 'dice' ? '🎲' : '✊✋✌️',
-                    },
-                };
-
             default:
                 this.logger.warn({ type }, 'Unknown NapCat segment type:');
                 return null;
         }
     }
+
+    private truncateText(text: string, maxLength = 500): string {
+        if (!text) return '';
+        if (text.length <= maxLength) return text;
+        return `${text.slice(0, maxLength - 3)}...`;
+    }
 }
+

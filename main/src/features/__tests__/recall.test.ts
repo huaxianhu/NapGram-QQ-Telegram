@@ -1,7 +1,4 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { RecallFeature } from '../recall/RecallFeature';
-import type { RecallEvent } from '../../domain/message';
-import type { IQQClient } from '../../infrastructure/clients/qq';
 
 // Mock database
 vi.mock('../../domain/models/db', () => ({
@@ -13,6 +10,21 @@ vi.mock('../../domain/models/db', () => ({
     },
 }));
 
+// Mock environment
+vi.mock('../../domain/models/env', () => ({
+    default: {
+        ENABLE_AUTO_RECALL: true,
+        LOG_FILE: '/tmp/test-logs/app.log',
+        LOG_LEVEL: 'off',
+        LOG_FILE_LEVEL: 'off',
+        DATA_DIR: '/tmp/test-data',
+    },
+}));
+
+// Now import after mocks are set up
+import { RecallFeature } from '../RecallFeature';
+import type { RecallEvent } from '../../domain/message';
+import type { IQQClient } from '../../infrastructure/clients/qq';
 import db from '../../domain/models/db';
 
 const createMockQQClient = (): IQQClient => ({
@@ -41,6 +53,11 @@ const createMockQQClient = (): IQQClient => ({
 
 const createMockTgBot = () => ({
     deleteMessages: vi.fn(),
+    getChat: vi.fn().mockResolvedValue({
+        deleteMessages: vi.fn().mockResolvedValue(undefined),
+    }),
+    addDeletedMessageEventHandler: vi.fn(),
+    removeDeletedMessageEventHandler: vi.fn(),
 } as any);
 
 const createMockInstance = () => ({
@@ -88,6 +105,11 @@ describe('RecallFeature', () => {
             (db.message.findFirst as any).mockResolvedValue(mockDbEntry);
             (db.message.update as any).mockResolvedValue({ ...mockDbEntry, deleted: true });
 
+            const mockChat = {
+                deleteMessages: vi.fn().mockResolvedValue(undefined),
+            };
+            mockTgBot.getChat.mockResolvedValue(mockChat);
+
             await recallFeature['handleQQRecall'](recallEvent);
 
             expect(db.message.findFirst).toHaveBeenCalledWith({
@@ -98,11 +120,8 @@ describe('RecallFeature', () => {
                 },
             });
 
-            expect(mockTgBot.deleteMessages).toHaveBeenCalledWith(
-                mockDbEntry.tgChatId,
-                [mockDbEntry.tgMsgId],
-                { revoke: true }
-            );
+            expect(mockTgBot.getChat).toHaveBeenCalledWith(Number(mockDbEntry.tgChatId));
+            expect(mockChat.deleteMessages).toHaveBeenCalledWith([mockDbEntry.tgMsgId]);
 
             expect(db.message.update).toHaveBeenCalledWith({
                 where: { id: 1 },
@@ -145,7 +164,13 @@ describe('RecallFeature', () => {
             };
 
             (db.message.findFirst as any).mockResolvedValue(mockDbEntry);
-            mockTgBot.deleteMessages.mockRejectedValue(new Error('TG API Error'));
+            (db.message.update as any).mockResolvedValue({ ...mockDbEntry, ignoreDelete: true });
+
+            // Mock getChat to return a chat with failing deleteMessages
+            const mockChat = {
+                deleteMessages: vi.fn().mockRejectedValue(new Error('TG API Error')),
+            };
+            mockTgBot.getChat.mockResolvedValue(mockChat);
 
             await expect(
                 recallFeature['handleQQRecall'](recallEvent)
@@ -226,7 +251,7 @@ describe('RecallFeature', () => {
         it('should cleanup on destroy', () => {
             recallFeature.destroy();
 
-            expect(mockQQClient.removeListener).toHaveBeenCalledWith('recall', expect.any(Function));
+            expect(mockQQClient.off).toHaveBeenCalledWith('recall', expect.any(Function));
         });
     });
 });
