@@ -1,24 +1,22 @@
-name: Build and publish docker container
+name: Build and publish (dev)
 
 on:
   schedule:
     - cron: '30 15 * * *' # 每天 UTC 15:30(=北京 23:30)
-  release:
-    types: [published]
   workflow_dispatch:
 
 jobs:
   publish:
-    name: Publish container image
+    name: Publish dev container image
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     env:
-      BUILD_REF: ${{ github.event_name == 'schedule' && 'refs/heads/dev' || github.ref }}
-      BUILD_REF_NAME: ${{ github.event_name == 'schedule' && 'dev' || github.ref_name }}
+      BUILD_REF: refs/heads/dev
+      BUILD_REF_NAME: dev
     steps:
-      - name: Checkout
+      - name: Checkout (dev)
         uses: actions/checkout@v4
         with:
           ref: ${{ env.BUILD_REF }}
@@ -27,6 +25,20 @@ jobs:
       - name: Derive build info
         run: echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
+      - name: Derive Docker Hub target (optional)
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "DOCKERHUB_ENABLED=1" >> "$GITHUB_ENV"
+            if [ -n "${{ secrets.DOCKERHUB_IMAGE }}" ]; then
+              echo "DOCKERHUB_IMAGE=${{ secrets.DOCKERHUB_IMAGE }}" >> "$GITHUB_ENV"
+            else
+              echo "DOCKERHUB_IMAGE=docker.io/${{ secrets.DOCKERHUB_USERNAME }}/napgram" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "DOCKERHUB_ENABLED=0" >> "$GITHUB_ENV"
+            echo "DOCKERHUB_IMAGE=" >> "$GITHUB_ENV"
+          fi
+
       - name: Checkout UI source (private)
         uses: actions/checkout@v4
         with:
@@ -34,23 +46,6 @@ jobs:
           ref: main
           token: ${{ secrets.UI_SRC_TOKEN }}
           path: web
-
-      - name: Check pushes today (UTC+8)
-        id: check_push
-        run: |
-          # schedule 任务按每天构建 dev，无需检查 push
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "has_push=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git fetch origin
-          TZ=Asia/Shanghai
-          since=$(date -d 'today 00:00' +"%Y-%m-%dT%H:%M:%S")
-          if git log --since="$since" --format=oneline origin/main | head -n 1; then
-            echo "has_push=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_push=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -64,7 +59,10 @@ jobs:
           run_install: false
 
       - name: Install dependencies
-        run: pnpm install
+        # CI 默认会启用 frozen-lockfile；但这里会用私有 UI 仓库覆盖 ./web，
+        # 可能导致根目录 pnpm-lock.yaml 与 ./web/package.json 不一致，从而安装失败。
+        # 允许在 CI 内自动更新 lockfile，供后续 web build + docker build 使用。
+        run: pnpm install --no-frozen-lockfile
 
       - name: Build web dist
         run: pnpm --filter web build
@@ -78,13 +76,10 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
-            docker.io/${{ secrets.DOCKERHUB_USERNAME }}/napgram
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            type=raw,value=main-latest,enable=${{ env.BUILD_REF == 'refs/heads/main' }}
-            type=raw,value=dev-latest,enable=${{ env.BUILD_REF == 'refs/heads/dev' }}
-            type=raw,value=main-${{ env.DATE }},enable=${{ env.BUILD_REF == 'refs/heads/main' }}
-            type=raw,value=dev-${{ env.DATE }},enable=${{ env.BUILD_REF == 'refs/heads/dev' }}
-            type=ref,event=tag
+            type=raw,value=dev-latest
+            type=raw,value=dev-${{ env.DATE }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -100,7 +95,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request' && github.actor != 'dependabot[bot]'
+        if: env.DOCKERHUB_ENABLED == '1' && github.actor != 'dependabot[bot]'
         uses: docker/login-action@v3
         with:
           registry: docker.io
@@ -111,7 +106,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' && github.actor != 'dependabot[bot]' }}
+          push: ${{ github.actor != 'dependabot[bot]' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64
@@ -127,15 +122,20 @@ jobs:
             npmrc=//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}
 
       - name: Send Telegram Notification on Success
-        if: success() && (github.event_name != 'schedule' || steps.check_push.outputs.has_push == 'true')
+        if: success()
         env:
-          MESSAGE: |
-            ✅ Docker Build Success
-            
-            Repo: ${{ github.repository }}
-            Tag/Branch: ${{ env.BUILD_REF_NAME }}
-            Image: ghcr.io/${{ github.repository }}:${{ startsWith(env.BUILD_REF, 'refs/tags/') && env.BUILD_REF_NAME || format('{0}-latest', env.BUILD_REF_NAME) }}
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
+          IMAGES="$(printf '%s\n' "$TAGS" | sed '/^$/d' | sed 's/^/  - /')"
+          MESSAGE="$(cat <<EOF
+          ✅ Docker Build Success (dev)
+
+          Repo: ${{ github.repository }}
+          Ref: ${{ env.BUILD_REF_NAME }} @ ${{ env.BUILD_SHA }}
+          Images:
+          ${IMAGES}
+          EOF
+          )"
           curl -fSs -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
             -d "chat_id=${{ secrets.TELEGRAM_TO_GROUP }}" \
             -d "message_thread_id=${{ secrets.TELEGRAM_TOPIC_ID }}" \
